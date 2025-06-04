@@ -32,7 +32,7 @@ library(gridExtra)
 ## Loading data in R and some data manipulation
 
 ```{r read data, echo = FALSE}
-dat <- read_sav("MasterDatabase_CueReactivity_CONTINUOUS-FINAL.sav")
+dat <- read_sav("MasterDatabase.sav")
 
 dat <- dat %>% 
   mutate(Race = case_when(

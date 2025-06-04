@@ -1,0 +1,254 @@
+---
+title: "AlcoholCueReactivity"
+output: html_document
+date: "2025-06-04"
+---
+
+```{r}
+
+```
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages, echo=FALSE, message=FALSE}
+library(readxl)
+library(tidyverse)
+library(tidyr)
+library(randomForest)
+library(mice)
+library(caret)
+library(glmnet)
+library(gbm)
+library(table1)
+library(haven)
+library(sjPlot)
+library(pdp)
+library(plotmo)
+library(gridExtra)
+```
+
+## Loading data in R and some data manipulation
+
+```{r read data, echo = FALSE}
+dat <- read_sav("MasterDatabase_CueReactivity_CONTINUOUS-FINAL.sav")
+
+dat <- dat %>% 
+  mutate(Race = case_when(
+    Race == 1 ~ "White",
+    Race == 2 ~ "Black",
+    Race > 2  ~ "Other"
+  )) %>% 
+  mutate(Race = factor(Race, c("White", "Black", "Other"))) %>%
+  select(-ID) %>%
+  mutate(
+    FTND_1 = factor(FTND_1, labels = c("Non-Smoker", "Occasional Smoker", "Daily smoker")),
+    SCID_AUD_diag = factor(SCID_AUD_diag, labels = c("Mild", "Moderate", "Severe")),
+    Sex = factor(Sex, labels = c("Male", "Female")),
+    Ethnicity = factor(Ethnicity, labels = c("No", "Yes")),
+    TreatmentSeeking = factor(TreatmentSeeking, labels = c("No", "Yes")),
+    Tox_THC = factor(Tox_THC, labels = c("No", "Yes"))
+  )
+```
+
+## Descriptive Statistics
+
+```{r descriptives, echo = FALSE}
+summary(dat$Alcohol_AUQ)
+
+ggplot(dat, aes(x = Alcohol_AUQ)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  theme_minimal() +
+  labs(title = "Distribution of Alcohol_AUQ", x = "Alcohol_AUQ Score", y = "Count")
+```
+
+## Regularization with Lasso and Ridge
+
+```{r regularization}
+x <- model.matrix(Alcohol_AUQ ~ ., dat)[,-1]
+y <- dat$Alcohol_AUQ
+
+set.seed(1000)
+cv.lasso <- cv.glmnet(x, y, alpha = 1, family = "gaussian")
+model_lasso <- glmnet(x, y, alpha = 1, family = "gaussian", lambda = cv.lasso$lambda.min)
+
+cv.ridge <- cv.glmnet(x, y, alpha = 0, family = "gaussian")
+model_ridge <- glmnet(x, y, alpha = 0, family = "gaussian", lambda = cv.ridge$lambda.min)
+```
+
+## Model Performance: Cross-Validation and RMSE
+
+```{r cross-validation}
+n <- nrow(dat)
+folds <- createFolds(1:n, k = 10, list = TRUE)
+
+pred_lasso <- rep(NA, n)
+pred_ridge <- rep(NA, n)
+pred_rf <- rep(NA, n)
+
+for (i in 1:length(folds)) {
+  train.data <- dat[-folds[[i]], ]
+  test.data <- dat[folds[[i]], ]
+  
+  x_train <- model.matrix(Alcohol_AUQ ~ ., train.data)[,-1]
+  y_train <- train.data$Alcohol_AUQ
+  x_test <- model.matrix(Alcohol_AUQ ~ ., test.data)[,-1]
+  
+  model_lasso_cv <- glmnet(x_train, y_train, alpha = 1, family = "gaussian", lambda = cv.lasso$lambda.min)
+  model_ridge_cv <- glmnet(x_train, y_train, alpha = 0, family = "gaussian", lambda = cv.ridge$lambda.min)
+  rf_cv <- randomForest(Alcohol_AUQ ~ ., data = train.data, ntree = 1000)
+  
+  pred_lasso[folds[[i]]] <- predict(model_lasso_cv, newx = x_test)
+  pred_ridge[folds[[i]]] <- predict(model_ridge_cv, newx = x_test)
+  pred_rf[folds[[i]]] <- predict(rf_cv, newdata = test.data)
+}
+
+rmse <- function(true, pred) sqrt(mean((true - pred)^2))
+
+cat("RMSE - Lasso:", rmse(dat$Alcohol_AUQ, pred_lasso), "\n")
+cat("RMSE - Ridge:", rmse(dat$Alcohol_AUQ, pred_ridge), "\n")
+cat("RMSE - Random Forest:", rmse(dat$Alcohol_AUQ, pred_rf), "\n")
+```
+
+## Top Predictors from Lasso, Ridge, and Random Forest
+
+```{r final models for importance plots}
+# Fit final Random Forest model on full data
+rf_model <- randomForest(Alcohol_AUQ ~ ., data = dat, ntree = 1000, importance = TRUE)
+```
+
+```{r top predictors}
+# Lasso Coefficients
+lasso_coefs <- coef(model_lasso)
+lasso_df <- as.data.frame(as.matrix(lasso_coefs))
+lasso_df <- tibble::rownames_to_column(lasso_df, "Variable")
+colnames(lasso_df)[2] <- "Coefficient"
+lasso_df <- lasso_df %>%
+  filter(Coefficient != 0 & Variable != "(Intercept)") %>%
+  arrange(desc(abs(Coefficient)))
+
+# Plot Lasso
+ggplot(lasso_df, aes(x = reorder(Variable, abs(Coefficient)), y = Coefficient)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top Predictors from Lasso Regression", x = "Variable", y = "Coefficient") +
+  theme_minimal()
+
+# Ridge Coefficients
+ridge_coefs <- coef(model_ridge)
+ridge_df <- as.data.frame(as.matrix(ridge_coefs))
+ridge_df <- tibble::rownames_to_column(ridge_df, "Variable")
+colnames(ridge_df)[2] <- "Coefficient"
+ridge_df <- ridge_df %>%
+  filter(Variable != "(Intercept)") %>%
+  arrange(desc(abs(Coefficient)))
+
+# Plot Ridge
+ggplot(ridge_df, aes(x = reorder(Variable, abs(Coefficient)), y = Coefficient)) +
+  geom_col(fill = "tomato") +
+  coord_flip() +
+  labs(title = "Top Predictors from Ridge Regression", x = "Variable", y = "Coefficient") +
+  theme_minimal()
+
+
+# Plot Mean Decrease Gini (IncNodePurity)
+rf_importance <- as.data.frame(importance(rf_model))
+rf_importance <- tibble::rownames_to_column(rf_importance, "Variable")
+rf_importance %>%
+  arrange(desc(IncNodePurity)) %>%
+  ggplot(aes(x = reorder(Variable, IncNodePurity), y = IncNodePurity)) +
+  geom_col(fill = "purple") +
+  coord_flip() +
+  labs(title = "Top Predictors from Random Forest (Mean Decrease Gini)", 
+       x = "Variable", y = "Mean Decrease in Gini") +
+  theme_minimal()
+
+
+## LASSO Lollipop Plot (Grayscale)
+ggplot(lasso_df, aes(x = Coefficient, y = reorder(Variable, Coefficient))) +
+  geom_segment(aes(x = 0, xend = Coefficient, y = Variable, yend = Variable),
+               color = "grey50", size = 1.5) +
+  geom_point(color = "black", size = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(title = "Top Predictors from Lasso Regression",
+       x = "Coefficient", y = "Variable") +
+  theme_minimal()
+
+## RIDGE Lollipop Plot (Grayscale)
+ggplot(ridge_df, aes(x = Coefficient, y = reorder(Variable, Coefficient))) +
+  geom_segment(aes(x = 0, xend = Coefficient, y = Variable, yend = Variable),
+               color = "grey50", size = 1.5) +
+  geom_point(color = "black", size = 3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(title = "Top Predictors from Ridge Regression",
+       x = "Coefficient", y = "Variable") +
+  theme_minimal()
+
+## RANDOM FOREST (Gini) Lollipop Plot (Grayscale)
+rf_importance %>%
+  arrange(desc(IncNodePurity)) %>%
+  ggplot(aes(x = IncNodePurity, y = reorder(Variable, IncNodePurity))) +
+  geom_segment(aes(x = 0, xend = IncNodePurity, y = Variable, yend = Variable),
+               color = "grey50", size = 1.5) +
+  geom_point(color = "black", size = 3) +
+  labs(title = "Top Predictors from Random Forest (Gini Importance)",
+       x = "Mean Decrease in Gini", y = "Variable") +
+  theme_minimal()
+```
+
+
+```{r rmse-comparison, warning=FALSE, message=FALSE}
+
+# ---- Null Model RMSE ----
+null_pred <- mean(dat$Alcohol_AUQ)
+null_rmse <- sqrt(mean((dat$Alcohol_AUQ - null_pred)^2))
+cat("Null RMSE (Mean-only model):", round(null_rmse, 2), "\n")
+
+# ---- Model RMSEs ----
+rmse_lasso <- rmse(dat$Alcohol_AUQ, pred_lasso)
+rmse_ridge <- rmse(dat$Alcohol_AUQ, pred_ridge)
+rmse_rf    <- rmse(dat$Alcohol_AUQ, pred_rf)
+
+# ---- Compare RMSEs ----
+cat("\nModel RMSEs:\n")
+cat("Lasso:", round(rmse_lasso, 2), "\n")
+cat("Ridge:", round(rmse_ridge, 2), "\n")
+cat("Random Forest:", round(rmse_rf, 2), "\n")
+```
+
+```{r pdp-rf-improved, warning=FALSE, message=FALSE}
+library(pdp)
+
+# Select key variables you want to plot
+top_rf_vars <- c("AUQ_baseline", "PACS_total", "OCDS_compulsive", "ADS_Obsessive", "TLFB_TOTDRINKS")
+
+# Define y-axis range using full model predictions
+rf_preds <- predict(rf_model, newdata = dat)
+y_range <- range(rf_preds)
+
+# Layout plots side by side
+par(mfrow = c(1, 2))  # 2 plots per row
+
+for (v in top_rf_vars) {
+  if (v %in% names(dat)) {
+    pd <- partial(rf_model,
+                  pred.var = v,
+                  train = dat,
+                  grid.resolution = 20,  # increases range resolution
+                  pred.fun = NULL)  # default prediction function
+    
+    plot(pd,
+         main = paste("PDP:", v),
+         xlab = v,
+         ylab = "Predicted Alcohol_AUQ",
+         col = "black",
+         lwd = 2,
+         ylim = y_range)  # standardize y-axis across plots
+  } else {
+    warning(paste("Variable not found:", v))
+  }
+}
+
+par(mfrow = c(1,1))
+```
